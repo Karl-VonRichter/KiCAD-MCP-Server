@@ -19,8 +19,10 @@ bare "Failed to load schematic" that names neither a token nor a line:
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -36,6 +38,7 @@ _KICAD_CLI = resolve_kicad_cli()
 V8 = 20231120
 V9 = 20250114
 V10 = 20260101
+V10_0_6 = 20260306
 
 
 def _standin_library_text(lib_id: str, name: str) -> str:
@@ -172,13 +175,15 @@ class TestKicad10TokensAreVersionGated:
         for token in ("(exclude_from_sim no)", "(in_bom yes)", "(on_board yes)", "(dnp no)"):
             assert token in header, f"{token} missing from {header}"
 
-    def test_kicad10_version_keeps_kicad10_tokens(self, tmp_path: Path) -> None:
-        sch = _sch_with_version(tmp_path, V10)
+    @pytest.mark.parametrize("version", [V10, V10_0_6])
+    def test_kicad10_version_keeps_kicad10_tokens(self, tmp_path: Path, version: int) -> None:
+        sch = _sch_with_version(tmp_path, version)
         assert _place(sch, "Device", "R", "R1", value="10k", x=100, y=100)
 
         header = _placed_symbol_header(sch.read_text(), "Device:R")
         assert "(body_style 1)" in header
         assert "(in_pos_files yes)" in header
+        assert f"(version {version})" in sch.read_text()
 
     def test_missing_version_is_treated_as_kicad10(self, tmp_path: Path) -> None:
         """Absent version keeps the pre-fix behaviour rather than silently downgrading."""
@@ -191,7 +196,7 @@ class TestKicad10TokensAreVersionGated:
 
     @pytest.mark.parametrize(
         "version,expected",
-        [(V8, False), (V9, False), (V10, True), (V10 + 1, True)],
+        [(V8, False), (V9, False), (V10, True), (V10 + 1, True), (V10_0_6, True)],
     )
     def test_support_predicate(self, version: int, expected: bool) -> None:
         from commands.dynamic_symbol_loader import DynamicSymbolLoader
@@ -322,17 +327,18 @@ class TestRealKicadLoadsTheResult:
     """
 
     @staticmethod
-    def _cli_major() -> int:
+    def _cli_version() -> tuple:
         out = subprocess.run(
             [str(_KICAD_CLI), "version"], capture_output=True, text=True, timeout=60
         )
-        m = re.match(r"\s*(\d+)", out.stdout)
-        return int(m.group(1)) if m else 0
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout)
+        return tuple(int(part) for part in m.groups()) if m else (0, 0, 0)
 
-    @pytest.mark.parametrize("version", [V8, V9])
+    @pytest.mark.parametrize("version", [V8, V9, V10, V10_0_6])
     def test_placed_symbols_load(self, tmp_path: Path, version: int) -> None:
-        if self._cli_major() < 9:
-            pytest.skip("needs KiCad >= 9 to read a 20250114 file")
+        required = (10, 0, 6) if version == V10_0_6 else (10, 0, 0) if version == V10 else (9, 0, 0)
+        if self._cli_version() < required:
+            pytest.skip(f"needs KiCad >= {required} to read a {version} file")
 
         sch = _sch_with_version(tmp_path, version)
         # power:GND exercises escaping, Device:R exercises the attribute line.
@@ -349,3 +355,95 @@ class TestRealKicadLoadsTheResult:
             f"KiCad refused a v{version} schematic it should accept.\n"
             f"stdout: {out.stdout}\nstderr: {out.stderr}"
         )
+
+    def test_edit_native_kicad10_schematic(self, tmp_path: Path) -> None:
+        """A file resaved by KiCad must still accept symbols without losing fields."""
+        if self._cli_version() < (10, 0, 6):
+            pytest.skip("needs KiCad >= 10.0.6")
+
+        sch = _sch_with_version(tmp_path, V10_0_6)
+        assert _place(sch, "Device", "R", "R1", value="10k", x=100, y=100)
+        upgraded = subprocess.run(
+            [str(_KICAD_CLI), "sch", "upgrade", "--force", str(sch)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert upgraded.returncode == 0, upgraded.stderr
+        original = sch.read_text(encoding="utf-8")
+        original_version = re.search(r"\(version\s+(\d+)\)", original).group(1)
+        assert int(original_version) >= V10_0_6
+
+        from commands.schematic_text_utils import _find_placed_symbol_block
+
+        first_symbol, _, _ = _find_placed_symbol_block(original, "R1")
+        assert first_symbol is not None
+        assert _place(sch, "Device", "R", "R2", value="22k", x=120, y=100)
+        edited = sch.read_text(encoding="utf-8")
+        assert f"(version {original_version})" in edited
+        assert first_symbol in edited
+
+        netlist = tmp_path / "edited.xml"
+        exported = subprocess.run(
+            [
+                str(_KICAD_CLI),
+                "sch",
+                "export",
+                "netlist",
+                "--format",
+                "kicadxml",
+                "-o",
+                str(netlist),
+                str(sch),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert exported.returncode == 0, exported.stderr
+        components = ET.parse(netlist).findall("./components/comp")
+        assert {c.get("ref"): c.findtext("value") for c in components} == {
+            "R1": "10k",
+            "R2": "22k",
+        }
+
+    @pytest.mark.parametrize("creator", ["schematic", "project"])
+    @pytest.mark.parametrize("fallback", [False, True])
+    def test_new_schematic_exports(
+        self, tmp_path: Path, monkeypatch: Any, creator: str, fallback: bool
+    ) -> None:
+        if self._cli_version() < (10, 0, 6):
+            pytest.skip("needs KiCad >= 10.0.6")
+
+        import os
+
+        from commands import project, schematic
+        from utils.kicad_file_formats import SCHEMATIC_HEADER
+
+        if fallback:
+            exists = os.path.exists
+            monkeypatch.setattr(
+                os.path,
+                "exists",
+                lambda path: False if str(path).endswith("blank.kicad_sch") else exists(path),
+            )
+        if creator == "schematic":
+            monkeypatch.setattr(schematic, "Schematic", MagicMock())
+            schematic.SchematicManager.create_schematic("fresh", path=str(tmp_path))
+        else:
+            monkeypatch.setattr(project, "pcbnew", MagicMock())
+            result = project.ProjectCommands().create_project(
+                {"name": "fresh", "path": str(tmp_path)}
+            )
+            assert result["success"], result
+
+        sch = tmp_path / "fresh.kicad_sch"
+        assert sch.read_text(encoding="utf-8").startswith(SCHEMATIC_HEADER)
+        assert _place(sch, "Device", "R", "R1", value="10k", x=100, y=100)
+        exported = subprocess.run(
+            [str(_KICAD_CLI), "sch", "export", "svg", str(sch), "-o", str(tmp_path / "svg")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert exported.returncode == 0, exported.stderr

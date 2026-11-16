@@ -35,6 +35,8 @@ logger = logging.getLogger("kicad_interface")
 #: v9 file either way (kicad-cli 10.0.0), so gating on the file's declared
 #: version costs nothing there and keeps the file loadable everywhere else.
 _KICAD10_SCH_VERSION = 20260101
+# This compatibility threshold must not track the version emitted for NEW
+# schematics: earlier KiCad 10 files still support these symbol attributes.
 
 # Module-level caches shared across DynamicSymbolLoader instances.
 # A fresh loader is created for every add_component call (see

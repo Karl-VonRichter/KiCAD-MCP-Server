@@ -1091,6 +1091,13 @@ Look for a ready-made part before generating a custom one.
 
 **KiCAD 9.0 or higher**
 
+- New projects, standalone schematics and Eagle schematic imports target
+  KiCad 10.0.6's schematic format (`20260306`). Use KiCad 10.0.6 or newer
+  for these generated schematics. Editing existing schematics preserves
+  their declared format, including earlier KiCad 10 and KiCad 8/9 files.
+- PCB and footprint serialization uses the installed KiCad API. With 10.0.6,
+  its native PCB format is `20260206`; symbol libraries have their own format
+  version (`20251024`). Older library files remain readable by KiCad 10.0.6.
 - Download from [kicad.org/download](https://www.kicad.org/download/)
 - Must include Python module (pcbnew)
 - Verify installation:
